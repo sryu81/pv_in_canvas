@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>EPICS 3D Dashboard with HTML-in-Canvas</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #111;
+      color: #fff;
+      font-family: sans-serif;
+    }
+    /* The 3D Canvas visible to the user */
+    #scadaCanvas3D {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    
+    #textureSourceBuffer {
+      position: fixed;
+      left: 0;
+      top: 0;
+      transform: scale(0);
+      transform-origin: top left;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>  
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+  <!-- 1. Master WebGL Viewport Surface -->
+  <canvas id="scadaCanvas3D"></canvas>
+
+  <!-- 2. Independent, Hidden Layout Engine Target -->
+  <canvas id="textureSourceBuffer" width="512" height="512" layoutsubtree>    
+    <div layoutsubtree id="canvasUi" style="display: flex; flex-direction: column; justify-content: center; gap: 30px; font-family: monospace; font-size: 28px; padding: 40px; width: 512px; height: 512px; background: #1e1e24; box-sizing: border-box; color: white;">
+    
+    <!-- Header Title inside the 3D Text Card -->
+    <div style="text-align: center; color: #ffffff; font-size: 32px; font-weight: bold; border-bottom: 2px solid #444; padding-bottom: 15px; margin-bottom: 10px;">
+        SYSTEM STATUS
+    </div>
+
+    <div style="display: flex; justify-content: space-between; color: #00ffcc; border-bottom: 1px solid #333; padding-bottom: 10px;">
+        <span>Temperature:</span>
+        <strong id="pv-temp">---</strong>
+    </div>
+    
+    <div style="display: flex; justify-content: space-between; color: #ffcc00; border-bottom: 1px solid #333; padding-bottom: 10px;">
+        <span>Humidity:</span>
+        <strong id="pv-humidity">---</strong>
+    </div>
+
+    <div style="display: flex; justify-content: space-between; color: #ff3366; padding-bottom: 10px;">
+        <span>Valve Status:</span>
+        <strong id="pv-valve">---</strong>
+    </div>
+    
+    </div>
+  </canvas>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const canvas3D = document.getElementById('scadaCanvas3D');
+    const bufferCanvas = document.getElementById('textureSourceBuffer');
+    const bufferCtx = bufferCanvas.getContext('2d');
+    const uiContainer = document.getElementById('canvasUi');
+
+    const fields = {
+        'ROOM:TEMP': { el: document.getElementById('pv-temp'), unit: ' °C' },
+        'ROOM:HUMIDITY': { el: document.getElementById('pv-humidity'), unit: ' %' },
+        'VALVE:STATE': { el: document.getElementById('pv-valve'), unit: '' }
+    };
+
+    // --- Setup Three.js WebGL Pipeline ---
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 3.2;
+
+    const renderer = new THREE.WebGLRenderer({ canvas: canvas3D, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    const controls = new OrbitControls(camera, canvas3D);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.enableZoom = true;
+    controls.enablePan = false;
+
+    let userInteracting = false;
+    controls.addEventListener('start', () => { userInteracting = true; });
+    controls.addEventListener('end', () => { userInteracting = false; });
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Use the offscreen layout buffer canvas as our 3D texture source maps
+    const uiTexture = new THREE.CanvasTexture(bufferCanvas);
+    const material = new THREE.MeshBasicMaterial({ map: uiTexture });
+    
+    const geometry = new THREE.BoxGeometry(1.8, 1.8, 1.8);
+    const industrialCube = new THREE.Mesh(geometry, material);
+
+    scene.add(industrialCube);
+
+    bufferCanvas.onpaint = () => {
+        bufferCtx.reset();
+        
+        // Background fill backdrop
+        bufferCtx.fillStyle = '#1e1e24';
+        bufferCtx.fillRect(0, 0, bufferCanvas.width, bufferCanvas.height);
+        
+        if (typeof bufferCtx.drawElementImage === 'function') {
+            bufferCtx.drawElementImage(uiContainer, 0, 0);
+        } else {
+            // Fallback warning text if the Chrome flag is turned off
+            bufferCtx.fillStyle = 'red';
+            bufferCtx.font = '20px Arial';
+            bufferCtx.fillText("Missing Flag: #canvas-draw-element", 20, 50);
+        }
+    };
+    
+    // --- Main 3D Loop Animation Frame Window ---
+    function animateLoop() {
+        requestAnimationFrame(animateLoop);
+
+        controls.update();
+
+        if (!userInteracting) {
+            industrialCube.rotation.x += 0.003;
+            industrialCube.rotation.y += 0.007;
+        }
+
+        // Force browser to run HTML layout render on the offscreen canvas texture
+        if (typeof bufferCanvas.requestPaint === 'function') {
+            bufferCanvas.requestPaint();
+        } else {
+            bufferCanvas.onpaint();
+        }
+
+        // Notify Three.js to re-upload the modified canvas pixels to the GPU
+        uiTexture.needsUpdate = true;
+        renderer.render(scene, camera);
+    }
+
+    // --- WebSocket Event Connection Node ---
+    const ws = new WebSocket('ws://localhost:8765');
+
+    ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        const pvTarget = fields[data.pv];
+
+        if (pvTarget) {
+            if (typeof data.value === 'number') {
+                pvTarget.el.textContent = data.value.toFixed(2) + pvTarget.unit;
+            } else if (Array.isArray(data.value)) {
+                if (data.value.length > 0 && typeof data.value[0] === 'number') {
+                    const cleanString = data.value
+                      .filter(code => code !== 0)
+                      .map(code => String.fromCharCode(code))
+                      .join('')
+                      .trim();
+                    pvTarget.el.textContent = cleanString + pvTarget.unit;
+                } else {
+                    pvTarget.el.textContent = data.value.join('') + pvTarget.unit;
+                }
+            } else {
+                pvTarget.el.textContent = data.value + pvTarget.unit;
+            }
+        }
+    };
+
+    // Kick off animation sequence
+    animateLoop();
+  </script>
+
+</body>
+</html>

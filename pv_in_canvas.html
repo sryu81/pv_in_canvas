@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>EPICS PV Rendering with HTML-in-Canvas</title>
+  <style>
+    body {
+      background: #111;
+      color: #fff;
+      font-family: sans-serif;
+      margin: 20px;
+    }
+    canvas {
+      border: 2px solid #333;
+      background: #1a1a1a;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Live EPICS PV Canvas</h1>
+  
+  <!-- The Canvas acts as the master graphics element -->
+  <canvas id="scadaCanvas" width="800" height="400" layoutsubtree>    
+    <!-- Experimental 'layoutsubtree' instructs the browser to layout 
+         this standard DOM structure internally inside the canvas pixel space -->
+    <div layoutsubtree id="canvasUi" style="display: flex; flex-direction: column; gap: 15px; font-family: monospace; font-size: 18px; padding: 20px; width: 350px; background: rgba(0,0,0,0.7); border-radius: 8px;">
+      
+      <div style="display: flex; justify-content: space-between; color: #00ffcc;">
+        <span>Temperature:</span>
+        <span id="pv-temp">---</span>
+      </div>
+      
+      <div style="display: flex; justify-content: space-between; color: #ffcc00;">
+        <span>Humidity:</span>
+        <span id="pv-humidity">---</span>
+      </div>
+
+      <div style="display: flex; justify-content: space-between; color: #ff3366;">
+        <span>Valve Status:</span>
+        <span id="pv-valve">---</span>
+      </div>
+      
+    </div>
+  </canvas>
+
+  <script>
+    // --- ADDED FIX HERE: Define the history tracking variables ---
+    const tempHistory = [];
+    const maxHistoryPoints = 60; 
+
+    const canvas = document.getElementById('scadaCanvas');
+    const ctx = canvas.getContext('2d');
+    const uiContainer = document.getElementById('canvasUi');
+
+    // DOM caches for fast rendering injection
+    const fields = {
+        'ROOM:TEMP': { el: document.getElementById('pv-temp'), unit: ' °C' },
+        'ROOM:HUMIDITY': { el: document.getElementById('pv-humidity'), unit: ' %' },
+        'VALVE:STATE': { el: document.getElementById('pv-valve'), unit: '' }
+    };
+
+    // 1. Core Render Cycle
+    canvas.onpaint = () => {
+        ctx.reset(); 
+        
+        // --- Draw Background Grid ---
+        ctx.strokeStyle = '#2d2d2d';
+        ctx.lineWidth = 1;
+        for (let i = 0; i < canvas.width; i += 40) {
+          ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, canvas.height); ctx.stroke();
+        }
+        for (let j = 0; j < canvas.height; j += 40) {
+          ctx.beginPath(); ctx.moveTo(0, j); ctx.lineTo(canvas.width, j); ctx.stroke();
+        }
+
+        // --- Draw the Live Moving Graph Line ---
+        if (tempHistory.length > 1) {
+          ctx.strokeStyle = '#00ffcc'; // Match temperature text accent color
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+
+          // Chart spatial layout boundaries
+          const startX = 450; 
+          const chartWidth = 300;
+          const chartHeight = 200;
+          const baseY = 250;
+
+          for (let i = 0; i < tempHistory.length; i++) {
+              // Spread points horizontally along the chart space
+              const x = startX + (i / (maxHistoryPoints - 1)) * chartWidth;
+              
+              // Calculate height based on expected temperature bounds (15°C to 35°C)
+              const normalizedVal = (tempHistory[i] - 15) / (35 - 15);
+              const y = baseY - (normalizedVal * chartHeight);
+
+              if (i === 0) ctx.moveTo(x, y);
+              else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+
+          // Graph Border Label Accent
+          ctx.strokeStyle = '#444';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(450, 50, 300, 200);
+        }
+
+        // --- Draw the HTML UI Layout Tree ---
+        if (typeof ctx.drawElementImage === 'function') {
+          ctx.drawElementImage(uiContainer, 50, 50);
+        } else {
+          ctx.fillStyle = 'white';
+          ctx.font = '14px Arial';
+          ctx.fillText("Error: Ensure chrome://flags/#canvas-draw-element is ENABLED.", 50, 50);
+        }
+    };
+
+    // 2. Connect to the Python Server
+    const ws = new WebSocket('ws://localhost:8765');
+
+    ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        const pvTarget = fields[data.pv];
+
+        if (pvTarget) {
+          // Manage Live Graph array values when temperature changes
+          if (data.pv === 'ROOM:TEMP') {
+              tempHistory.push(data.value);
+              if (tempHistory.length > maxHistoryPoints) {
+                tempHistory.shift(); // Evict old values to slide the graph forward
+              }
+          }
+
+          if (typeof data.value === 'number') {
+              pvTarget.el.textContent = data.value.toFixed(2) + pvTarget.unit;
+          } else if (Array.isArray(data.value)) {
+              // If Python sends an array of character byte numbers (like [67, 76, 79, 83, 69, 68])
+              if (data.value.length > 0 && typeof data.value[0] === 'number') {
+                  // Filter out zero bytes, convert character codes to text, and join them
+                  const cleanString = data.value
+                    .filter(code => code !== 0)
+                    .map(code => String.fromCharCode(code))
+                    .join('')
+                    .trim();
+                  
+                  pvTarget.el.textContent = cleanString + pvTarget.unit;
+              } else {
+                  // If it's a single-item array containing just a string or value
+                  pvTarget.el.textContent = data.value.join('') + pvTarget.unit;
+              }
+          } else {
+              // Fallback for standard string structures
+              pvTarget.el.textContent = data.value + pvTarget.unit;
+          }
+
+          // Request frame updates
+          if (typeof canvas.requestPaint === 'function') {
+              canvas.requestPaint();
+          } else {
+              requestAnimationFrame(canvas.onpaint);
+          }
+        }
+    };
+
+    // Initial render request on boot
+    if (typeof canvas.requestPaint === 'function') {
+        canvas.requestPaint();
+    } else {
+        canvas.onpaint();
+    }
+  </script>
+
+</body>
+</html>
